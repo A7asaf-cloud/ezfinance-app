@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import t from '../utils/translations'
 
 function Card({ children, className = '' }) {
@@ -11,20 +11,59 @@ function Card({ children, className = '' }) {
 
 const inputCls = 'px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full'
 
-async function fetchLivePrice(symbol) {
-  try {
-    const url = `https://corsproxy.io/?https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`
-    const res = await fetch(url)
-    const json = await res.json()
-    const meta = json.chart.result[0].meta
-    return {
-      price: meta.regularMarketPrice,
-      prevClose: meta.chartPreviousClose,
-    }
-  } catch {
-    return null
-  }
+// Fetch with timeout helper
+function fetchWithTimeout(url, ms = 9000) {
+  const controller = new AbortController()
+  const id = setTimeout(() => controller.abort(), ms)
+  return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(id))
 }
+
+// Try multiple proxies + endpoints for Yahoo Finance
+async function fetchLivePrice(symbol) {
+  const sym = symbol.toUpperCase()
+  const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`
+  const quoteUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${sym}`
+
+  const parseChart = (json) => {
+    const meta = json?.chart?.result?.[0]?.meta
+    if (!meta?.regularMarketPrice) throw new Error('no price')
+    return { price: meta.regularMarketPrice, prevClose: meta.chartPreviousClose }
+  }
+
+  const parseQuote = (json) => {
+    const q = json?.quoteResponse?.result?.[0]
+    if (!q?.regularMarketPrice) throw new Error('no price')
+    return { price: q.regularMarketPrice, prevClose: q.regularMarketPreviousClose }
+  }
+
+  const attempts = [
+    // 1. corsproxy.io — chart v8
+    { url: `https://corsproxy.io/?${chartUrl}`, parse: parseChart },
+    // 2. allorigins — chart v8
+    { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(chartUrl)}`, parse: parseChart },
+    // 3. corsproxy.io — quote v7
+    { url: `https://corsproxy.io/?${quoteUrl}`, parse: parseQuote },
+    // 4. allorigins — quote v7
+    { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(quoteUrl)}`, parse: parseQuote },
+    // 5. corsproxy.io — query2 mirror
+    { url: `https://corsproxy.io/?https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`, parse: parseChart },
+  ]
+
+  for (const { url, parse } of attempts) {
+    try {
+      const res = await fetchWithTimeout(url, 9000)
+      if (!res.ok) continue
+      const json = await res.json()
+      const result = parse(json)
+      return result
+    } catch {
+      // try next
+    }
+  }
+  return null
+}
+
+const CACHE_KEY = 'stocks_price_cache'
 
 export default function Stocks({ lang }) {
   const tr = t[lang] || t.en
@@ -32,10 +71,14 @@ export default function Stocks({ lang }) {
   const [portfolio, setPortfolio] = useState(
     () => JSON.parse(localStorage.getItem('stocks') || '[]')
   )
-  const [livePrices, setLivePrices] = useState({})
+
+  // Seed livePrices from cache so table isn't empty on load
+  const [livePrices, setLivePrices] = useState(
+    () => JSON.parse(localStorage.getItem(CACHE_KEY) || '{}')
+  )
   const [loading, setLoading] = useState(false)
   const [lastUpdated, setLastUpdated] = useState(null)
-  const [stale, setStale] = useState({})
+  const [fetchErrors, setFetchErrors] = useState({})
 
   const [symbol, setSymbol] = useState('')
   const [shares, setShares] = useState('')
@@ -46,55 +89,72 @@ export default function Stocks({ lang }) {
     localStorage.setItem('stocks', JSON.stringify(list))
   }
 
-  const refreshAll = async (list) => {
-    const target = list || portfolio
+  const refreshAll = useCallback(async (overrideList) => {
+    const target = overrideList ?? JSON.parse(localStorage.getItem('stocks') || '[]')
     if (target.length === 0) return
     setLoading(true)
+
     const results = await Promise.all(
       target.map(async (s) => {
         const data = await fetchLivePrice(s.symbol)
         return { symbol: s.symbol, data }
       })
     )
-    const newPrices = { ...livePrices }
-    const newStale = { ...stale }
-    results.forEach(({ symbol: sym, data }) => {
-      if (data) {
-        newPrices[sym] = data
-        newStale[sym] = false
-      } else {
-        newStale[sym] = true
-      }
+
+    setLivePrices(prev => {
+      const updated = { ...prev }
+      results.forEach(({ symbol: sym, data }) => {
+        if (data) updated[sym] = data
+      })
+      localStorage.setItem(CACHE_KEY, JSON.stringify(updated))
+      return updated
     })
-    setLivePrices(newPrices)
-    setStale(newStale)
+
+    setFetchErrors(prev => {
+      const errs = { ...prev }
+      results.forEach(({ symbol: sym, data }) => {
+        errs[sym] = !data
+      })
+      return errs
+    })
+
     setLastUpdated(new Date().toLocaleTimeString())
     setLoading(false)
-  }
+  }, [])
 
+  // Auto-refresh on mount and every 60s
   useEffect(() => {
     refreshAll()
-    const id = setInterval(() => refreshAll(), 60000)
+    const id = setInterval(refreshAll, 60000)
     return () => clearInterval(id)
-  }, [portfolio])
+  }, [refreshAll, portfolio])
 
   const addStock = async () => {
     if (!symbol.trim() || !shares || !buyPrice) return
     if (isNaN(Number(shares)) || isNaN(Number(buyPrice))) return
     const sym = symbol.trim().toUpperCase()
+    // Prevent duplicate symbols
+    if (portfolio.find(s => s.symbol === sym)) {
+      alert(`${sym} already in portfolio`)
+      return
+    }
     const newStock = { symbol: sym, shares: Number(shares), buyPrice: Number(buyPrice) }
     const newList = [...portfolio, newStock]
     savePortfolio(newList)
-    setSymbol('')
-    setShares('')
-    setBuyPrice('')
+    setSymbol(''); setShares(''); setBuyPrice('')
+
+    // Fetch price for new stock immediately
     setLoading(true)
     const data = await fetchLivePrice(sym)
     if (data) {
-      setLivePrices(prev => ({ ...prev, [sym]: data }))
-      setStale(prev => ({ ...prev, [sym]: false }))
+      setLivePrices(prev => {
+        const updated = { ...prev, [sym]: data }
+        localStorage.setItem(CACHE_KEY, JSON.stringify(updated))
+        return updated
+      })
+      setFetchErrors(prev => ({ ...prev, [sym]: false }))
     } else {
-      setStale(prev => ({ ...prev, [sym]: true }))
+      setFetchErrors(prev => ({ ...prev, [sym]: true }))
     }
     setLastUpdated(new Date().toLocaleTimeString())
     setLoading(false)
@@ -105,7 +165,8 @@ export default function Stocks({ lang }) {
     savePortfolio(newList)
   }
 
-  const fmt = (n, dec = 2) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec })
+  const fmt = (n, dec = 2) =>
+    '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec })
   const fmtPct = (n) => (n >= 0 ? '+' : '') + Number(n).toFixed(2) + '%'
 
   let portfolioTotalValue = 0
@@ -120,10 +181,9 @@ export default function Stocks({ lang }) {
           <input
             className={inputCls}
             type="text"
-            placeholder={tr.symbol + ' (e.g. AAPL)'}
+            placeholder={`${tr.symbol} (e.g. AAPL)`}
             value={symbol}
             onChange={e => setSymbol(e.target.value.toUpperCase())}
-            style={{ textTransform: 'uppercase' }}
           />
           <input
             className={inputCls}
@@ -161,11 +221,18 @@ export default function Stocks({ lang }) {
               </span>
             )}
             {loading && (
-              <span className="text-xs text-blue-500 animate-pulse">{tr.loading}</span>
+              <span className="inline-flex items-center gap-1 text-xs text-blue-500">
+                <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                </svg>
+                {tr.loading}
+              </span>
             )}
             <button
               onClick={() => refreshAll()}
-              className="px-3 py-1.5 text-xs bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition"
+              disabled={loading}
+              className="px-3 py-1.5 text-xs bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition disabled:opacity-50"
             >
               ↻ Refresh
             </button>
@@ -192,53 +259,77 @@ export default function Stocks({ lang }) {
               <tbody>
                 {portfolio.map((stock, idx) => {
                   const lp = livePrices[stock.symbol]
+                  const hasError = fetchErrors[stock.symbol]
                   const currentPrice = lp?.price
                   const prevClose = lp?.prevClose
 
-                  const todayChange = currentPrice != null && prevClose != null ? currentPrice - prevClose : null
-                  const todayChangePct = todayChange != null && prevClose ? (todayChange / prevClose) * 100 : null
-                  const totalValue = currentPrice != null ? stock.shares * currentPrice : null
-                  const pnl = totalValue != null ? totalValue - stock.shares * stock.buyPrice : null
-                  const pnlPct = pnl != null ? (pnl / (stock.shares * stock.buyPrice)) * 100 : null
+                  const todayChange = currentPrice != null && prevClose != null
+                    ? currentPrice - prevClose : null
+                  const todayChangePct = todayChange != null && prevClose
+                    ? (todayChange / prevClose) * 100 : null
+                  const totalValue = currentPrice != null
+                    ? stock.shares * currentPrice : null
+                  const pnl = totalValue != null
+                    ? totalValue - stock.shares * stock.buyPrice : null
+                  const pnlPct = pnl != null
+                    ? (pnl / (stock.shares * stock.buyPrice)) * 100 : null
 
                   if (totalValue != null) portfolioTotalValue += totalValue
                   if (pnl != null) portfolioTotalPnl += pnl
 
-                  const isStale = stale[stock.symbol]
-
                   return (
                     <tr key={idx} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50">
                       <td className="py-3 pe-4 font-bold text-gray-900 dark:text-white">
-                        {isStale && <span title="Using cached price">⚠️ </span>}
+                        {hasError && currentPrice == null && (
+                          <span title="Could not fetch price" className="me-1">⚠️</span>
+                        )}
+                        {hasError && currentPrice != null && (
+                          <span title="Showing cached price" className="me-1 text-yellow-500">📌</span>
+                        )}
                         {stock.symbol}
                       </td>
                       <td className="py-3 pe-4 text-end text-gray-700 dark:text-gray-300">{stock.shares}</td>
                       <td className="py-3 pe-4 text-end text-gray-700 dark:text-gray-300">{fmt(stock.buyPrice)}</td>
                       <td className="py-3 pe-4 text-end font-medium text-gray-900 dark:text-white">
-                        {currentPrice != null ? fmt(currentPrice) : <span className="text-gray-400">—</span>}
+                        {currentPrice != null
+                          ? fmt(currentPrice)
+                          : <span className="text-yellow-500 text-xs">{loading ? '...' : 'Fetching'}</span>}
                       </td>
-                      <td className={`py-3 pe-4 text-end font-medium ${todayChange == null ? '' : todayChange >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                      <td className={`py-3 pe-4 text-end font-medium ${
+                        todayChange == null ? '' : todayChange >= 0
+                          ? 'text-green-600 dark:text-green-400'
+                          : 'text-red-600 dark:text-red-400'
+                      }`}>
                         {todayChange != null ? (
-                          <span>{todayChange >= 0 ? '+' : ''}{fmt(todayChange)} ({fmtPct(todayChangePct)})</span>
+                          <>{todayChange >= 0 ? '+' : ''}{fmt(todayChange)} <span className="text-xs">({fmtPct(todayChangePct)})</span></>
                         ) : <span className="text-gray-400">—</span>}
                       </td>
                       <td className="py-3 pe-4 text-end font-medium text-gray-900 dark:text-white">
                         {totalValue != null ? fmt(totalValue) : <span className="text-gray-400">—</span>}
                       </td>
-                      <td className={`py-3 pe-4 text-end font-medium ${pnl == null ? '' : pnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                      <td className={`py-3 pe-4 text-end font-medium ${
+                        pnl == null ? ''
+                          : pnl >= 0 ? 'text-green-600 dark:text-green-400'
+                          : 'text-red-600 dark:text-red-400'
+                      }`}>
                         {pnl != null ? (
-                          <span>{pnl >= 0 ? '+' : ''}{fmt(pnl)} ({fmtPct(pnlPct)})</span>
+                          <>{pnl >= 0 ? '+' : ''}{fmt(pnl)} <span className="text-xs">({fmtPct(pnlPct)})</span></>
                         ) : <span className="text-gray-400">—</span>}
                       </td>
                       <td className="py-3">
-                        <button onClick={() => removeStock(idx)} className="text-gray-400 hover:text-red-500 text-xs transition">{tr.remove}</button>
+                        <button
+                          onClick={() => removeStock(idx)}
+                          className="text-gray-400 hover:text-red-500 text-xs transition"
+                        >
+                          {tr.remove}
+                        </button>
                       </td>
                     </tr>
                   )
                 })}
 
                 {/* Total Row */}
-                <tr className="bg-gray-50 dark:bg-gray-800/50 font-bold">
+                <tr className="bg-gray-50 dark:bg-gray-800/50 font-bold border-t-2 border-gray-200 dark:border-gray-700">
                   <td className="py-3 pe-4 text-gray-900 dark:text-white" colSpan={5}>{tr.portfolioTotal}</td>
                   <td className="py-3 pe-4 text-end text-gray-900 dark:text-white">{fmt(portfolioTotalValue)}</td>
                   <td className={`py-3 pe-4 text-end ${portfolioTotalPnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
